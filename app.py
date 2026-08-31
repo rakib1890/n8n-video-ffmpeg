@@ -3,239 +3,63 @@ import subprocess
 import requests
 import os
 import uuid
-import io
-import logging
-import time
+import tempfile
+import shutil
 
 app = Flask(__name__)
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-PORT = int(os.environ.get("PORT", "10000"))
-
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
-DOWNLOAD_TIMEOUT = (20, 300)
-DOWNLOAD_RETRIES = 3
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-logger = logging.getLogger(__name__)
+DOWNLOAD_TIMEOUT = 120
+FFMPEG_TIMEOUT = 600
 
 
-# ============================================================
-# COMMON HELPERS
-# ============================================================
+@app.route("/", methods=["GET"])
+def home():
+    return "FFmpeg Video + Audio Merge + Concat Service is running!"
 
-def is_valid_url(url):
-    return (
-        isinstance(url, str)
-        and (
-            url.startswith("http://")
-            or url.startswith("https://")
-        )
+
+def download_file(url, path):
+    if not url or not isinstance(url, str):
+        raise ValueError("Invalid file URL")
+
+    response = requests.get(
+        url,
+        stream=True,
+        timeout=DOWNLOAD_TIMEOUT
     )
+    response.raise_for_status()
 
-
-def download_file(url, output_path):
-    last_error = None
-
-    for attempt in range(1, DOWNLOAD_RETRIES + 1):
-
-        try:
-            logger.info(
-                "Downloading file: attempt %s/%s",
-                attempt,
-                DOWNLOAD_RETRIES
-            )
-
-            with requests.get(
-                url,
-                stream=True,
-                timeout=DOWNLOAD_TIMEOUT,
-                headers={
-                    "User-Agent": "Mozilla/5.0 FFmpeg-Service"
-                }
-            ) as response:
-
-                response.raise_for_status()
-
-                content_length = response.headers.get(
-                    "content-length"
-                )
-
-                if content_length:
-                    if int(content_length) > MAX_FILE_SIZE:
-                        raise ValueError(
-                            "File is larger than 500 MB"
-                        )
-
-                downloaded = 0
-
-                with open(output_path, "wb") as file:
-
-                    for chunk in response.iter_content(
-                        chunk_size=1024 * 1024
-                    ):
-
-                        if not chunk:
-                            continue
-
-                        downloaded += len(chunk)
-
-                        if downloaded > MAX_FILE_SIZE:
-                            raise ValueError(
-                                "Downloaded file exceeded 500 MB"
-                            )
-
-                        file.write(chunk)
-
-            logger.info(
-                "Download completed: %.2f MB",
-                downloaded / 1024 / 1024
-            )
-
-            return True
-
-        except Exception as error:
-
-            last_error = error
-
-            logger.warning(
-                "Download failed: %s",
-                error
-            )
-
-            if os.path.exists(output_path):
-                os.remove(output_path)
-
-            if attempt < DOWNLOAD_RETRIES:
-                time.sleep(2)
-
-    raise RuntimeError(
-        f"Download failed after {DOWNLOAD_RETRIES} attempts: "
-        f"{last_error}"
-    )
+    with open(path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
 
 def run_ffmpeg(command):
-    logger.info("Running FFmpeg")
-
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        timeout=FFMPEG_TIMEOUT
     )
 
     if result.returncode != 0:
-
-        logger.error(
-            "FFmpeg error:\n%s",
-            result.stderr[-5000:]
-        )
-
         raise RuntimeError(
-            result.stderr[-3000:]
+            "FFmpeg failed:\n" + result.stderr[-5000:]
         )
 
-    return result
-
-
-def cleanup(files):
-
-    for file in files:
-
-        try:
-
-            if os.path.exists(file):
-                os.remove(file)
-
-        except Exception as error:
-
-            logger.warning(
-                "Cleanup failed for %s: %s",
-                file,
-                error
-            )
-
-
-def return_video(file_path, filename):
-
-    with open(file_path, "rb") as file:
-        data = file.read()
-
-    return send_file(
-        io.BytesIO(data),
-        mimetype="video/mp4",
-        as_attachment=True,
-        download_name=filename
-    )
-
-
-# ============================================================
-# HOME / HEALTH
-# ============================================================
-
-@app.route("/", methods=["GET"])
-def home():
-
-    return jsonify({
-        "success": True,
-        "service": "FFmpeg Video + Audio Merge Service",
-        "status": "running",
-        "version": "3.0"
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-
-    return jsonify({
-        "success": True,
-        "status": "healthy"
-    })
-
-
-# ============================================================
-# MERGE VIDEO + AUDIO
-# ============================================================
 
 @app.route("/merge", methods=["POST"])
 def merge():
-
     data = request.get_json(silent=True) or {}
 
     video_url = data.get("video_url")
     audio_url = data.get("audio_url")
 
     if not video_url or not audio_url:
-
         return jsonify({
             "success": False,
             "error": "video_url and audio_url are required"
-        }), 400
-
-    if not is_valid_url(video_url):
-
-        return jsonify({
-            "success": False,
-            "error": "Invalid video_url"
-        }), 400
-
-    if not is_valid_url(audio_url):
-
-        return jsonify({
-            "success": False,
-            "error": "Invalid audio_url"
         }), 400
 
     job_id = str(uuid.uuid4())
@@ -244,413 +68,224 @@ def merge():
     audio_file = f"/tmp/{job_id}_audio.mp3"
     output_file = f"/tmp/{job_id}_merged.mp4"
 
-    files = [
-        video_file,
-        audio_file,
-        output_file
-    ]
-
-    logger.info(
-        "Starting merge job: %s",
-        job_id
-    )
-
     try:
+        download_file(video_url, video_file)
+        download_file(audio_url, audio_file)
 
-        # Download video
-        download_file(
-            video_url,
-            video_file
-        )
+        run_ffmpeg([
+            "ffmpeg",
+            "-y",
+            "-i", video_file,
+            "-i", audio_file,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_file
+        ])
 
-        # Download audio
-        download_file(
-            audio_url,
-            audio_file
-        )
-
-        # ----------------------------------------------------
-        # FAST MODE
-        # ----------------------------------------------------
-
-        try:
-
-            run_ffmpeg([
-                "ffmpeg",
-                "-y",
-
-                "-i",
-                video_file,
-
-                "-i",
-                audio_file,
-
-                "-map",
-                "0:v:0",
-
-                "-map",
-                "1:a:0",
-
-                "-c:v",
-                "copy",
-
-                "-c:a",
-                "aac",
-
-                "-b:a",
-                "192k",
-
-                "-shortest",
-
-                "-movflags",
-                "+faststart",
-
-                output_file
-            ])
-
-        except Exception as fast_error:
-
-            logger.warning(
-                "Fast merge failed. Using fallback encoder."
-            )
-
-            if os.path.exists(output_file):
-                os.remove(output_file)
-
-            # ------------------------------------------------
-            # FALLBACK MODE
-            # ------------------------------------------------
-
-            run_ffmpeg([
-                "ffmpeg",
-                "-y",
-
-                "-i",
-                video_file,
-
-                "-i",
-                audio_file,
-
-                "-map",
-                "0:v:0",
-
-                "-map",
-                "1:a:0",
-
-                "-c:v",
-                "libx264",
-
-                "-preset",
-                "veryfast",
-
-                "-crf",
-                "23",
-
-                "-pix_fmt",
-                "yuv420p",
-
-                "-c:a",
-                "aac",
-
-                "-b:a",
-                "192k",
-
-                "-shortest",
-
-                "-movflags",
-                "+faststart",
-
-                output_file
-            ])
-
-        logger.info(
-            "Merge successful: %s",
-            job_id
-        )
-
-        return return_video(
+        return send_file(
             output_file,
-            "segment_merged.mp4"
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="segment_merged.mp4"
         )
 
-    except Exception as error:
-
-        logger.exception(
-            "Merge failed: %s",
-            job_id
-        )
-
+    except Exception as e:
         return jsonify({
             "success": False,
-            "job_id": job_id,
-            "error": str(error)
+            "error": str(e)
         }), 500
 
     finally:
+        for file in [video_file, audio_file, output_file]:
+            try:
+                if os.path.exists(file):
+                    os.remove(file)
+            except Exception:
+                pass
 
-        cleanup(files)
-
-
-# ============================================================
-# CONCAT MULTIPLE VIDEOS
-# ============================================================
 
 @app.route("/concat", methods=["POST"])
 def concat():
-
     data = request.get_json(silent=True) or {}
 
-    # Supports both:
-    #
+    segments = data.get("segments")
+
+    # New format:
     # {
-    #   "videos": [...]
+    #   "segments": [
+    #       {
+    #           "video_url": "...",
+    #           "audio_url": "..."
+    #       }
+    #   ]
     # }
-    #
-    # and:
-    #
-    # {
-    #   "video_urls": [...]
-    # }
 
-    video_urls = (
-        data.get("videos")
-        or data.get("video_urls")
-    )
+    if segments is None:
+        # Backward compatibility with old format
+        video_urls = data.get("video_urls")
 
-    if not video_urls:
-
-        return jsonify({
-            "success": False,
-            "error": "videos or video_urls is required"
-        }), 400
-
-    if not isinstance(video_urls, list):
-
-        return jsonify({
-            "success": False,
-            "error": "videos must be a list"
-        }), 400
-
-    if len(video_urls) == 0:
-
-        return jsonify({
-            "success": False,
-            "error": "No videos provided"
-        }), 400
-
-    if len(video_urls) > 50:
-
-        return jsonify({
-            "success": False,
-            "error": "Maximum 50 videos per job"
-        }), 400
-
-    # Validate all URLs
-
-    for index, url in enumerate(video_urls):
-
-        if not is_valid_url(url):
-
+        if not isinstance(video_urls, list) or not video_urls:
             return jsonify({
                 "success": False,
-                "error": (
-                    f"Invalid video URL at index {index}"
-                )
+                "error": "segments or video_urls is required"
             }), 400
 
+        segments = [
+            {
+                "video_url": url,
+                "audio_url": None
+            }
+            for url in video_urls
+        ]
+
+    if not isinstance(segments, list) or len(segments) == 0:
+        return jsonify({
+            "success": False,
+            "error": "segments must be a non-empty list"
+        }), 400
+
     job_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{job_id}"
 
-    list_file = f"/tmp/{job_id}_concat.txt"
-    output_file = f"/tmp/{job_id}_final.mp4"
+    os.makedirs(work_dir, exist_ok=True)
 
-    local_files = []
-
-    logger.info(
-        "Starting concat job: %s",
-        job_id
-    )
+    merged_files = []
+    list_file = os.path.join(work_dir, "concat_list.txt")
+    final_file = os.path.join(work_dir, "final_video.mp4")
 
     try:
+        # --------------------------------------------------
+        # STEP 1: Download + merge every video/audio pair
+        # --------------------------------------------------
 
-        # ----------------------------------------------------
-        # DOWNLOAD VIDEOS IN ORDER
-        # ----------------------------------------------------
+        for index, segment in enumerate(segments):
 
-        for index, url in enumerate(video_urls):
+            if isinstance(segment, str):
+                video_url = segment
+                audio_url = None
+            else:
+                video_url = segment.get("video_url")
+                audio_url = segment.get("audio_url")
 
-            local_file = (
-                f"/tmp/{job_id}_segment_{index}.mp4"
-            )
-
-            download_file(
-                url,
-                local_file
-            )
-
-            local_files.append(local_file)
-
-        # ----------------------------------------------------
-        # CREATE FFmpeg CONCAT LIST
-        # ----------------------------------------------------
-
-        with open(
-            list_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            for video in local_files:
-
-                file.write(
-                    f"file '{video}'\n"
+            if not video_url:
+                raise ValueError(
+                    f"Segment {index + 1}: video_url is missing"
                 )
 
-        # ----------------------------------------------------
-        # FAST CONCAT
-        # ----------------------------------------------------
-
-        try:
-
-            run_ffmpeg([
-                "ffmpeg",
-                "-y",
-
-                "-f",
-                "concat",
-
-                "-safe",
-                "0",
-
-                "-i",
-                list_file,
-
-                "-c",
-                "copy",
-
-                "-movflags",
-                "+faststart",
-
-                output_file
-            ])
-
-        except Exception:
-
-            logger.warning(
-                "Fast concat failed. "
-                "Using re-encode fallback."
+            video_file = os.path.join(
+                work_dir,
+                f"video_{index}.mp4"
             )
 
-            if os.path.exists(output_file):
-                os.remove(output_file)
+            download_file(video_url, video_file)
 
-            # ------------------------------------------------
-            # FALLBACK CONCAT
-            # ------------------------------------------------
+            # If audio exists, merge it with the video
+            if audio_url:
 
-            run_ffmpeg([
-                "ffmpeg",
-                "-y",
+                audio_file = os.path.join(
+                    work_dir,
+                    f"audio_{index}.mp3"
+                )
 
-                "-f",
-                "concat",
+                merged_file = os.path.join(
+                    work_dir,
+                    f"merged_{index}.mp4"
+                )
 
-                "-safe",
-                "0",
+                download_file(audio_url, audio_file)
 
-                "-i",
-                list_file,
+                run_ffmpeg([
+                    "ffmpeg",
+                    "-y",
+                    "-i", video_file,
+                    "-i", audio_file,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "23",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    merged_file
+                ])
 
-                "-c:v",
-                "libx264",
+                merged_files.append(merged_file)
 
-                "-preset",
-                "veryfast",
+            else:
+                # No audio supplied, keep video
+                merged_files.append(video_file)
 
-                "-crf",
-                "23",
+        # --------------------------------------------------
+        # STEP 2: Create FFmpeg concat list
+        # --------------------------------------------------
 
-                "-pix_fmt",
-                "yuv420p",
+        with open(list_file, "w", encoding="utf-8") as f:
+            for file_path in merged_files:
+                safe_path = file_path.replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
 
-                "-c:a",
-                "aac",
+        # --------------------------------------------------
+        # STEP 3: Concatenate all segments
+        # Re-encode for maximum compatibility
+        # --------------------------------------------------
 
-                "-b:a",
-                "192k",
+        run_ffmpeg([
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            final_file
+        ])
 
-                "-movflags",
-                "+faststart",
-
-                output_file
-            ])
-
-        logger.info(
-            "Concat successful: %s",
-            job_id
+        return send_file(
+            final_file,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="final_video.mp4"
         )
 
-        return return_video(
-            output_file,
-            "final_video.mp4"
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Concat failed: %s",
-            job_id
-        )
+    except Exception as e:
 
         return jsonify({
             "success": False,
-            "job_id": job_id,
-            "error": str(error)
+            "error": str(e)
         }), 500
 
     finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
 
-        cleanup(
-            local_files
-            + [list_file, output_file]
-        )
 
-
-# ============================================================
-# ERROR HANDLERS
-# ============================================================
-
-@app.errorhandler(404)
-def not_found(error):
-
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
-        "success": False,
-        "error": "Endpoint not found"
-    }), 404
+        "status": "ok",
+        "service": "ffmpeg-video-audio-concat"
+    })
 
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-
-    return jsonify({
-        "success": False,
-        "error": "Method not allowed"
-    }), 405
-
-
-# ============================================================
-# START SERVER
-# ============================================================
 
 if __name__ == "__main__":
-
-    logger.info(
-        "Starting FFmpeg service on port %s",
-        PORT
-    )
+    port = int(os.environ.get("PORT", 10000))
 
     app.run(
         host="0.0.0.0",
-        port=PORT
+        port=port
     )
 
 
