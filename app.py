@@ -1,4 +1,3 @@
-```python
 from flask import Flask, request, jsonify, send_file
 import subprocess
 import requests
@@ -6,18 +5,23 @@ import os
 import uuid
 import io
 import logging
-import re
-from urllib.parse import urlparse
+import time
 
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB per downloaded file
-DOWNLOAD_TIMEOUT = (15, 300)       # connect, read timeout
-MAX_DOWNLOAD_RETRIES = 3
+PORT = int(os.environ.get("PORT", "10000"))
+
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+DOWNLOAD_TIMEOUT = (20, 300)
+DOWNLOAD_RETRIES = 3
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,42 +32,29 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# HELPERS
+# COMMON HELPERS
 # ============================================================
 
-def valid_url(url):
-    """Basic HTTP/HTTPS URL validation."""
-    if not isinstance(url, str):
-        return False
-
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except Exception:
-        return False
+def is_valid_url(url):
+    return (
+        isinstance(url, str)
+        and (
+            url.startswith("http://")
+            or url.startswith("https://")
+        )
+    )
 
 
-def safe_filename(value):
-    """Prevent unsafe filename characters."""
-    return re.sub(r"[^a-zA-Z0-9_.-]", "_", value)
-
-
-def download_file(url, destination):
-    """
-    Download remote file with retries and streaming.
-    Prevents loading the entire file into RAM.
-    """
-
-    if not valid_url(url):
-        raise ValueError(f"Invalid URL: {url}")
-
+def download_file(url, output_path):
     last_error = None
 
-    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
 
         try:
             logger.info(
-                f"Downloading file (attempt {attempt}/{MAX_DOWNLOAD_RETRIES})"
+                "Downloading file: attempt %s/%s",
+                attempt,
+                DOWNLOAD_RETRIES
             )
 
             with requests.get(
@@ -71,23 +62,25 @@ def download_file(url, destination):
                 stream=True,
                 timeout=DOWNLOAD_TIMEOUT,
                 headers={
-                    "User-Agent": "FFmpeg-Merge-Service/1.0"
+                    "User-Agent": "Mozilla/5.0 FFmpeg-Service"
                 }
             ) as response:
 
                 response.raise_for_status()
 
-                content_length = response.headers.get("content-length")
+                content_length = response.headers.get(
+                    "content-length"
+                )
 
                 if content_length:
                     if int(content_length) > MAX_FILE_SIZE:
                         raise ValueError(
-                            "Remote file exceeds maximum allowed size"
+                            "File is larger than 500 MB"
                         )
 
                 downloaded = 0
 
-                with open(destination, "wb") as file:
+                with open(output_path, "wb") as file:
 
                     for chunk in response.iter_content(
                         chunk_size=1024 * 1024
@@ -100,38 +93,40 @@ def download_file(url, destination):
 
                         if downloaded > MAX_FILE_SIZE:
                             raise ValueError(
-                                "Downloaded file exceeds maximum allowed size"
+                                "Downloaded file exceeded 500 MB"
                             )
 
                         file.write(chunk)
 
             logger.info(
-                f"Download completed: {downloaded / (1024 * 1024):.2f} MB"
+                "Download completed: %.2f MB",
+                downloaded / 1024 / 1024
             )
 
-            return
+            return True
 
-        except Exception as e:
+        except Exception as error:
 
-            last_error = e
+            last_error = error
 
             logger.warning(
-                f"Download failed on attempt {attempt}: {e}"
+                "Download failed: %s",
+                error
             )
 
-            if os.path.exists(destination):
-                os.remove(destination)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(2)
 
     raise RuntimeError(
-        f"Download failed after {MAX_DOWNLOAD_RETRIES} attempts: {last_error}"
+        f"Download failed after {DOWNLOAD_RETRIES} attempts: "
+        f"{last_error}"
     )
 
 
 def run_ffmpeg(command):
-    """
-    Run FFmpeg and return useful error information.
-    """
-
     logger.info("Running FFmpeg")
 
     result = subprocess.run(
@@ -143,38 +138,51 @@ def run_ffmpeg(command):
 
     if result.returncode != 0:
 
-        logger.error("FFmpeg failed")
-
-        logger.error(result.stderr[-5000:])
+        logger.error(
+            "FFmpeg error:\n%s",
+            result.stderr[-5000:]
+        )
 
         raise RuntimeError(
-            "FFmpeg processing failed:\n"
-            + result.stderr[-3000:]
+            result.stderr[-3000:]
         )
 
     return result
 
 
-def cleanup_files(files):
-    """Delete temporary files safely."""
+def cleanup(files):
 
     for file in files:
 
         try:
 
-            if file and os.path.exists(file):
+            if os.path.exists(file):
                 os.remove(file)
-                logger.info(f"Deleted temporary file: {file}")
 
-        except Exception as e:
+        except Exception as error:
 
             logger.warning(
-                f"Could not delete temporary file {file}: {e}"
+                "Cleanup failed for %s: %s",
+                file,
+                error
             )
 
 
+def return_video(file_path, filename):
+
+    with open(file_path, "rb") as file:
+        data = file.read()
+
+    return send_file(
+        io.BytesIO(data),
+        mimetype="video/mp4",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
 # ============================================================
-# HEALTH CHECK
+# HOME / HEALTH
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -184,7 +192,7 @@ def home():
         "success": True,
         "service": "FFmpeg Video + Audio Merge Service",
         "status": "running",
-        "version": "2.0"
+        "version": "3.0"
     })
 
 
@@ -198,7 +206,7 @@ def health():
 
 
 # ============================================================
-# VIDEO + AUDIO MERGE
+# MERGE VIDEO + AUDIO
 # ============================================================
 
 @app.route("/merge", methods=["POST"])
@@ -216,14 +224,14 @@ def merge():
             "error": "video_url and audio_url are required"
         }), 400
 
-    if not valid_url(video_url):
+    if not is_valid_url(video_url):
 
         return jsonify({
             "success": False,
             "error": "Invalid video_url"
         }), 400
 
-    if not valid_url(audio_url):
+    if not is_valid_url(audio_url):
 
         return jsonify({
             "success": False,
@@ -236,36 +244,33 @@ def merge():
     audio_file = f"/tmp/{job_id}_audio.mp3"
     output_file = f"/tmp/{job_id}_merged.mp4"
 
-    temp_files = [
+    files = [
         video_file,
         audio_file,
         output_file
     ]
 
-    logger.info(f"Starting merge job: {job_id}")
+    logger.info(
+        "Starting merge job: %s",
+        job_id
+    )
 
     try:
 
-        # ----------------------------------------------------
         # Download video
-        # ----------------------------------------------------
-
         download_file(
             video_url,
             video_file
         )
 
-        # ----------------------------------------------------
         # Download audio
-        # ----------------------------------------------------
-
         download_file(
             audio_url,
             audio_file
         )
 
         # ----------------------------------------------------
-        # First attempt: stream copy video
+        # FAST MODE
         # ----------------------------------------------------
 
         try:
@@ -303,18 +308,18 @@ def merge():
                 output_file
             ])
 
-        except Exception:
-
-            # ------------------------------------------------
-            # Fallback: re-encode video
-            # ------------------------------------------------
+        except Exception as fast_error:
 
             logger.warning(
-                "Stream copy failed. Starting re-encode fallback."
+                "Fast merge failed. Using fallback encoder."
             )
 
             if os.path.exists(output_file):
                 os.remove(output_file)
+
+            # ------------------------------------------------
+            # FALLBACK MODE
+            # ------------------------------------------------
 
             run_ffmpeg([
                 "ffmpeg",
@@ -358,40 +363,32 @@ def merge():
                 output_file
             ])
 
-        # ----------------------------------------------------
-        # Return binary video
-        # ----------------------------------------------------
-
-        with open(output_file, "rb") as file:
-
-            video_data = file.read()
-
         logger.info(
-            f"Merge completed successfully: {job_id}"
+            "Merge successful: %s",
+            job_id
         )
 
-        return send_file(
-            io.BytesIO(video_data),
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name="segment_merged.mp4"
+        return return_video(
+            output_file,
+            "segment_merged.mp4"
         )
 
-    except Exception as e:
+    except Exception as error:
 
         logger.exception(
-            f"Merge failed: {job_id}"
+            "Merge failed: %s",
+            job_id
         )
 
         return jsonify({
             "success": False,
             "job_id": job_id,
-            "error": str(e)
+            "error": str(error)
         }), 500
 
     finally:
 
-        cleanup_files(temp_files)
+        cleanup(files)
 
 
 # ============================================================
@@ -403,114 +400,113 @@ def concat():
 
     data = request.get_json(silent=True) or {}
 
-    # Support both:
+    # Supports both:
+    #
     # {
-    #   "video_urls": [...]
+    #   "videos": [...]
     # }
     #
     # and:
     #
     # {
-    #   "videos": [...]
+    #   "video_urls": [...]
     # }
 
     video_urls = (
-        data.get("video_urls")
-        or data.get("videos")
+        data.get("videos")
+        or data.get("video_urls")
     )
 
     if not video_urls:
 
         return jsonify({
             "success": False,
-            "error": "video_urls must be provided"
+            "error": "videos or video_urls is required"
         }), 400
 
     if not isinstance(video_urls, list):
 
         return jsonify({
             "success": False,
-            "error": "video_urls must be a list"
+            "error": "videos must be a list"
         }), 400
 
     if len(video_urls) == 0:
 
         return jsonify({
             "success": False,
-            "error": "video_urls cannot be empty"
+            "error": "No videos provided"
         }), 400
 
-    # Safety limit
-    if len(video_urls) > 100:
+    if len(video_urls) > 50:
 
         return jsonify({
             "success": False,
-            "error": "Maximum 100 videos allowed per concat job"
+            "error": "Maximum 50 videos per job"
         }), 400
 
-    # Validate URLs
+    # Validate all URLs
 
     for index, url in enumerate(video_urls):
 
-        if not valid_url(url):
+        if not is_valid_url(url):
 
             return jsonify({
                 "success": False,
-                "error": f"Invalid video URL at index {index}"
+                "error": (
+                    f"Invalid video URL at index {index}"
+                )
             }), 400
 
     job_id = str(uuid.uuid4())
 
-    local_files = []
-
     list_file = f"/tmp/{job_id}_concat.txt"
-
     output_file = f"/tmp/{job_id}_final.mp4"
 
-    temp_files = [
-        list_file,
-        output_file
-    ]
+    local_files = []
 
     logger.info(
-        f"Starting concat job: {job_id}"
+        "Starting concat job: %s",
+        job_id
     )
 
     try:
 
         # ----------------------------------------------------
-        # Download all videos
+        # DOWNLOAD VIDEOS IN ORDER
         # ----------------------------------------------------
 
         for index, url in enumerate(video_urls):
 
-            local_path = (
-                f"/tmp/{job_id}_{index}.mp4"
+            local_file = (
+                f"/tmp/{job_id}_segment_{index}.mp4"
             )
 
             download_file(
                 url,
-                local_path
+                local_file
             )
 
-            local_files.append(local_path)
-
-        temp_files.extend(local_files)
+            local_files.append(local_file)
 
         # ----------------------------------------------------
-        # Create concat file
+        # CREATE FFmpeg CONCAT LIST
         # ----------------------------------------------------
 
-        with open(list_file, "w") as file:
+        with open(
+            list_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
 
-            for path in local_files:
+            for video in local_files:
 
                 file.write(
-                    f"file '{path}'\n"
+                    f"file '{video}'\n"
                 )
 
         # ----------------------------------------------------
-        # First attempt: fast concat
+        # FAST CONCAT
         # ----------------------------------------------------
 
         try:
@@ -539,16 +535,17 @@ def concat():
 
         except Exception:
 
-            # ------------------------------------------------
-            # Fallback: re-encode
-            # ------------------------------------------------
-
             logger.warning(
-                "Fast concat failed. Starting re-encode fallback."
+                "Fast concat failed. "
+                "Using re-encode fallback."
             )
 
             if os.path.exists(output_file):
                 os.remove(output_file)
+
+            # ------------------------------------------------
+            # FALLBACK CONCAT
+            # ------------------------------------------------
 
             run_ffmpeg([
                 "ffmpeg",
@@ -587,40 +584,35 @@ def concat():
                 output_file
             ])
 
-        # ----------------------------------------------------
-        # Return final video
-        # ----------------------------------------------------
-
-        with open(output_file, "rb") as file:
-
-            final_video_data = file.read()
-
         logger.info(
-            f"Concat completed successfully: {job_id}"
+            "Concat successful: %s",
+            job_id
         )
 
-        return send_file(
-            io.BytesIO(final_video_data),
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name="final_video.mp4"
+        return return_video(
+            output_file,
+            "final_video.mp4"
         )
 
-    except Exception as e:
+    except Exception as error:
 
         logger.exception(
-            f"Concat failed: {job_id}"
+            "Concat failed: %s",
+            job_id
         )
 
         return jsonify({
             "success": False,
             "job_id": job_id,
-            "error": str(e)
+            "error": str(error)
         }), 500
 
     finally:
 
-        cleanup_files(temp_files)
+        cleanup(
+            local_files
+            + [list_file, output_file]
+        )
 
 
 # ============================================================
@@ -645,50 +637,21 @@ def method_not_allowed(error):
     }), 405
 
 
-@app.errorhandler(413)
-def request_too_large(error):
-
-    return jsonify({
-        "success": False,
-        "error": "Request too large"
-    }), 413
-
-
-@app.errorhandler(Exception)
-def global_error(error):
-
-    logger.exception(
-        "Unhandled server error"
-    )
-
-    return jsonify({
-        "success": False,
-        "error": str(error)
-    }), 500
-
-
 # ============================================================
-# RENDER START
+# START SERVER
 # ============================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
     logger.info(
-        f"Starting server on port {port}"
+        "Starting FFmpeg service on port %s",
+        PORT
     )
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=PORT
     )
-```
 
 
 
