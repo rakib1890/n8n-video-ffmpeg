@@ -52,7 +52,7 @@ def merge():
             output_file
         ], check=True)
 
-       from flask import send_file
+      
 
 return send_file(
     output_file,
