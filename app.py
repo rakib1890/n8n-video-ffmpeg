@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import subprocess
 import requests
 import os
@@ -52,11 +52,14 @@ def merge():
             output_file
         ], check=True)
 
-        return jsonify({
-            "success": True,
-            "message": "Video and audio merged successfully",
-            "output_file": output_file
-        })
+       from flask import send_file
+
+return send_file(
+    output_file,
+    mimetype="video/mp4",
+    as_attachment=True,
+    download_name="final_video.mp4"
+)
 
     except Exception as e:
         return jsonify({
