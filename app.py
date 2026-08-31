@@ -6,9 +6,11 @@ import uuid
 
 app = Flask(__name__)
 
+
 @app.route("/", methods=["GET"])
 def home():
     return "FFmpeg Video + Audio Merge Service is running!"
+
 
 @app.route("/merge", methods=["POST"])
 def merge():
@@ -52,14 +54,12 @@ def merge():
             output_file
         ], check=True)
 
-      
-
-return send_file(
-    output_file,
-    mimetype="video/mp4",
-    as_attachment=True,
-    download_name="final_video.mp4"
-)
+        return send_file(
+            output_file,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name="final_video.mp4"
+        )
 
     except Exception as e:
         return jsonify({
@@ -68,7 +68,7 @@ return send_file(
         }), 500
 
     finally:
-        for file in [video_file, audio_file]:
+        for file in [video_file, audio_file, output_file]:
             if os.path.exists(file):
                 os.remove(file)
 
